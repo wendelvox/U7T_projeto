@@ -1,0 +1,38 @@
+.pio_version 0
+
+.program U7T_projeto
+.side_set 1
+
+.define public T1 2  ; 0.25µs HIGH para '0', 0.5µs HIGH para '1'
+.define public T2 5  ; 0.625µs LOW para '0', 0.375µs LOW para '1'
+.define public T3 3  ; Tempo base antes do próximo bit
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [T3 - 1] ; Lê bit, pino LOW
+    jmp !x do_zero side 1 [T1 - 1] ; Se bit = 0, vai para do_zero
+do_one:
+    jmp bitloop    side 1 [T2 - 1] ; Bit = 1, mantém HIGH por T2-1
+do_zero:
+    nop            side 0 [T2 - 1] ; Bit = 0, mantém LOW por T2-1
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void U7T_projeto_program_init(PIO pio, uint sm, uint offset, uint pin, float freq) {
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+
+    pio_sm_config c = U7T_projeto_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, true, true, 8);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    float prescaler = (float)clock_get_hz(clk_sys) / (freq * 10);
+    sm_config_set_clkdiv(&c, prescaler);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

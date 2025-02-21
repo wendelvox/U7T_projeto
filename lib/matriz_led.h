@@ -15,11 +15,8 @@ typedef struct {
 extern pixel_t leds[LED_COUNT];
 
 // Funções da biblioteca
-void npInit(uint pin);
-void npSetLED(const uint index, const uint8_t r, const uint8_t g, const uint8_t b);
-void npClear();
-void npWrite();
-void npDraw(uint8_t vetorR[5][5], uint8_t vetorG[5][5], uint8_t vetorB[5][5]);
-int handle_numbers(char num);
+void matriz_led_init(void); // Inicializa os LEDs WS2812
+void update_flame_animation(uint8_t frame); // Atualiza a animação da chama
+void matriz_led_update(void); // Envia os dados para os LEDs
 
 #endif // MATRIZ_LED_H

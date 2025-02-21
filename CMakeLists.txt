@@ -65,4 +65,4 @@ target_link_libraries(U7T_projeto
 
 pico_add_extra_outputs(U7T_projeto)
 
-pico_generate_pio_header(U7T_projeto ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio)
+pico_generate_pio_header(U7T_projeto ${CMAKE_CURRENT_LIST_DIR}/U7T_projeto.pio)
