@@ -226,3 +226,40 @@ void ssd1306_draw_string(int x, int y, const char *str) {
         }
     }
 }
+void ssd1306_draw_hline(int x0, int x1, int y, bool color) {
+    // Garante que x0 seja menor que x1
+    if (x0 > x1) {
+        int temp = x0;
+        x0 = x1;
+        x1 = temp;
+    }
+
+    // Limita as coordenadas ao tamanho do display
+    if (y < 0 || y >= DISPLAY_HEIGHT) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 >= DISPLAY_WIDTH) x1 = DISPLAY_WIDTH - 1;
+
+    // Desenha a linha horizontal pixel por pixel
+    for (int x = x0; x <= x1; x++) {
+        ssd1306_draw_pixel(x, y, color);
+    }
+}
+
+void ssd1306_draw_vline(int x, int y0, int y1, bool color) {
+    // Garante que y0 seja menor que y1
+    if (y0 > y1) {
+        int temp = y0;
+        y0 = y1;
+        y1 = temp;
+    }
+
+    // Limita as coordenadas ao tamanho do display
+    if (x < 0 || x >= DISPLAY_WIDTH) return;
+    if (y0 < 0) y0 = 0;
+    if (y1 >= DISPLAY_HEIGHT) y1 = DISPLAY_HEIGHT - 1;
+
+    // Desenha a linha vertical pixel por pixel
+    for (int y = y0; y <= y1; y++) {
+        ssd1306_draw_pixel(x, y, color);
+    }
+}
