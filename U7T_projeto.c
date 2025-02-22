@@ -20,6 +20,7 @@
 #define LED_B          12
 #define DEADZONE       200
 #define WS2812_PIN     7
+#define DEBOUNCE_TIME  50000 // 50 ms em microssegundos
 
 // Definições de estados
 typedef enum {
@@ -35,7 +36,7 @@ typedef struct {
     float temp_min;
     float temp_max;
     const char* nome;
-    uint32_t duration; // Tempo em segundos
+    uint32_t duration;
 } brassagem_stage_t;
 
 static const brassagem_stage_t STAGES[] = {
@@ -52,9 +53,17 @@ static system_state_t current_state = MENU_INICIAL;
 static int menu_selection = 0;
 static uint8_t flame_frame = 0;
 static bool flame_active = false;
-static uint32_t timer_start = 0; // Tempo de início do temporizador
+static uint32_t timer_start = 0;
 static bool timer_active = false;
 static bool timer_finished = false;
+static float temperature = 0.0f;
+static bool display_needs_update = false;
+
+// Variáveis para debounce
+static uint64_t last_debounce_time_a = 0;
+static uint64_t last_debounce_time_b = 0;
+static bool last_state_a = true; // Pull-up, HIGH (1) é o estado inicial
+static bool last_state_b = true;
 
 static const uint8_t flame_frames[4][5][5] = {
     {{1, 2, 3, 2, 1}, {0, 1, 2, 1, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}},
@@ -62,6 +71,22 @@ static const uint8_t flame_frames[4][5][5] = {
     {{1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {0, 1, 2, 1, 0}, {0, 0, 1, 0, 0}},
     {{1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {1, 2, 3, 2, 0}, {0, 1, 0, 1, 0}}
 };
+
+// Função de debounce
+bool debounce_button(uint gpio, uint64_t now, bool* last_state, uint64_t* last_debounce_time) {
+    bool current_state = gpio_get(gpio);
+    if (current_state != *last_state) {
+        *last_debounce_time = now; // Resetar o tempo ao detectar mudança
+    }
+    if ((now - *last_debounce_time) > DEBOUNCE_TIME) {
+        if (!current_state) { // Botão pressionado (LOW)
+            *last_state = current_state;
+            return true;
+        }
+    }
+    *last_state = current_state;
+    return false;
+}
 
 // Funções de inicialização
 void pwm_init_gpio(uint gpio, uint32_t freq) {
@@ -147,7 +172,7 @@ void update_display(float temperature, const brassagem_stage_t* stage, bool flam
     ssd1306_update();
 }
 
-// Funções de controle de temperatura por estágio
+// Controle de temperatura
 void control_stage(float* temperature, const brassagem_stage_t* stage) {
     adc_select_input(1);
     uint16_t raw_y = adc_read();
@@ -155,11 +180,9 @@ void control_stage(float* temperature, const brassagem_stage_t* stage) {
     if (*temperature < stage->temp_min) *temperature = stage->temp_min;
     if (*temperature > stage->temp_max) *temperature = stage->temp_max;
 
-    // Tolerância de 5% abaixo do temp_max
     float tolerance = stage->temp_max * 0.05f;
     float threshold = stage->temp_max - tolerance;
 
-    // Chama apaga apenas ao atingir temp_max, reacende se cair mais de 5%
     if (*temperature >= stage->temp_max) {
         flame_active = false;
     } else if (*temperature < threshold) {
@@ -182,7 +205,6 @@ void update_flame_animation(PIO pio, uint sm, uint8_t frame) {
     }
 }
 
-// Função principal
 int main() {
     stdio_init_all();
     sleep_ms(2000);
@@ -201,8 +223,6 @@ int main() {
 
     pwm_init_gpio(BUZZER_PIN, 500);
     uint32_t wrap_value = clock_get_hz(clk_sys) / 500 - 1;
-    uint16_t pulse_min = wrap_value * 0.05;
-    uint16_t pulse_center = wrap_value * 0.075;
     uint16_t pulse_max = wrap_value * 0.1;
     stop_buzzer();
 
@@ -214,14 +234,63 @@ int main() {
 
     calibrate_joystick();
 
-    float temperature = 0.0f;
     uint32_t last_blink_time = 0;
     bool led_state = false;
     bool first_max_reached = false;
 
     while (true) {
-        uint32_t current_time = time_us_32() / 1000000; // Tempo em segundos
+        uint32_t current_time = time_us_32() / 1000000;
+        uint64_t now = time_us_64(); // Tempo em microssegundos para debounce
 
+        // Verifica os botões com debounce
+        bool btn_a_pressed = debounce_button(BTN_A, now, &last_state_a, &last_debounce_time_a);
+        bool btn_b_pressed = debounce_button(BTN_B, now, &last_state_b, &last_debounce_time_b);
+
+        // Lógica dos botões
+        if (btn_a_pressed) {
+            if (current_state == MENU_INICIAL) {
+                menu_selection = (menu_selection + 1) % NUM_STAGES;
+                display_needs_update = true; // O menu foi alterado
+            } else if (timer_finished) {
+                if (current_state == MASH_OUT) {
+                    current_state = MENU_INICIAL;
+                    menu_selection = 0;
+                } else {
+                    current_state = (system_state_t)(current_state + 1);
+                    temperature = STAGES[current_state - PARADA_PROTEICA].temp_min;
+                    timer_active = false;
+                    timer_finished = false;
+                    flame_active = true;
+                    first_max_reached = false;
+                }
+                display_needs_update = true; // O estado foi alterado
+                gpio_put(LED_G, false);
+                stop_buzzer();
+            }
+        }
+
+        if (btn_b_pressed) {
+            if (current_state == MENU_INICIAL) {
+                current_state = (system_state_t)(PARADA_PROTEICA + menu_selection);
+                temperature = STAGES[menu_selection].temp_min;
+                timer_active = false;
+                timer_finished = false;
+                flame_active = true;
+                first_max_reached = false;
+                display_needs_update = true; // O estado foi alterado
+            } else {
+                current_state = MENU_INICIAL;
+                flame_active = false;
+                timer_active = false;
+                timer_finished = false;
+                pwm_set_gpio_level(LED_R, 0);
+                gpio_put(LED_G, false);
+                stop_buzzer();
+                display_needs_update = true; // O estado foi alterado
+            }
+        }
+
+        // Lógica do estado
         switch (current_state) {
             case MENU_INICIAL:
                 show_menu(menu_selection);
@@ -231,19 +300,6 @@ int main() {
                 first_max_reached = false;
                 gpio_put(LED_G, false);
                 stop_buzzer();
-                if (!gpio_get(BTN_A)) { // Botão A avança no menu
-                    menu_selection = (menu_selection + 1) % NUM_STAGES;
-                    sleep_ms(200);
-                }
-                if (!gpio_get(BTN_B)) { // Botão B seleciona o estágio
-                    current_state = (system_state_t)(PARADA_PROTEICA + menu_selection);
-                    temperature = STAGES[menu_selection].temp_min;
-                    timer_active = false;
-                    timer_finished = false;
-                    flame_active = true;
-                    first_max_reached = false;
-                    sleep_ms(200);
-                }
                 break;
 
             case PARADA_PROTEICA:
@@ -253,63 +309,31 @@ int main() {
                 const brassagem_stage_t* stage = &STAGES[current_state - PARADA_PROTEICA];
                 uint32_t elapsed_time = timer_active ? (current_time - timer_start) : 0;
 
-                // Controle da temperatura
                 control_stage(&temperature, stage);
 
-                // Inicia o temporizador na primeira vez que atinge o máximo
                 if (!first_max_reached && temperature >= stage->temp_max) {
                     timer_start = current_time;
                     timer_active = true;
                     first_max_reached = true;
+                    display_needs_update = true; // O temporizador foi iniciado
                 }
 
-                // Verifica se o temporizador terminou
                 if (timer_active && elapsed_time >= stage->duration) {
                     timer_finished = true;
+                    display_needs_update = true; // O temporizador terminou
                 }
 
-                update_display(temperature, stage, flame_active, elapsed_time);
+                if (display_needs_update) {
+                    update_display(temperature, stage, flame_active, elapsed_time);
+                    display_needs_update = false; // Redefine a flag após a atualização
+                }
 
-                // Piscar LED verde e acionar buzzer quando o temporizador terminar
                 if (timer_finished) {
-                    if ((current_time - last_blink_time) >= 1) { // Piscar a cada 1 segundo
+                    if ((current_time - last_blink_time) >= 1) {
                         led_state = !led_state;
                         gpio_put(LED_G, led_state);
-                        if (led_state) {
-                            set_buzzer_position(pulse_max); // Som mais alto
-                            sleep_ms(250); // Duração maior do som
-                            stop_buzzer();
-                        }
                         last_blink_time = current_time;
                     }
-                    if (!gpio_get(BTN_A)) { // Botão A avança para próxima fase
-                        if (current_state == MASH_OUT) {
-                            current_state = MENU_INICIAL;
-                            menu_selection = 0;
-                        } else {
-                            current_state = (system_state_t)(current_state + 1);
-                            temperature = STAGES[current_state - PARADA_PROTEICA].temp_min;
-                            timer_active = false;
-                            timer_finished = false;
-                            flame_active = true;
-                            first_max_reached = false;
-                        }
-                        gpio_put(LED_G, false);
-                        stop_buzzer();
-                        sleep_ms(200);
-                    }
-                }
-
-                if (!gpio_get(BTN_B)) { // Botão B volta ao menu
-                    current_state = MENU_INICIAL;
-                    flame_active = false;
-                    timer_active = false;
-                    timer_finished = false;
-                    first_max_reached = false;
-                    pwm_set_gpio_level(LED_R, 0);
-                    gpio_put(LED_G, false);
-                    stop_buzzer();
-                    sleep_ms(200);
                 }
                 break;
             }
