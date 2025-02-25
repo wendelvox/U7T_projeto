@@ -263,3 +263,4 @@ void ssd1306_draw_vline(int x, int y0, int y1, bool color) {
         ssd1306_draw_pixel(x, y, color);
     }
 }
+

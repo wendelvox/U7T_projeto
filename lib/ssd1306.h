@@ -18,5 +18,6 @@ void ssd1306_update();
 void ssd1306_draw_char(int x, int y, char c);
 void ssd1306_draw_string(int x, int y, const char *str);
 void ssd1306_draw_hline(int x0, int x1, int y, bool color);
-void ssd1306_draw_vline(int x, int y0, int y1, bool color) ;
+void ssd1306_draw_vline(int x, int y0, int y1, bool color);
+
 #endif

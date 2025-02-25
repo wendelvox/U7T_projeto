@@ -21,6 +21,7 @@
 #define DEADZONE       200
 #define WS2812_PIN     7
 #define DEBOUNCE_TIME  50000 // 50 ms em microssegundos
+#define SERVO_PIN 15  // Pino para o servo motor
 
 // Definições de estados
 typedef enum {
@@ -53,7 +54,8 @@ static system_state_t current_state = MENU_INICIAL;
 static int menu_selection = 0;
 static uint8_t flame_frame = 0;
 static bool flame_active = false;
-static uint32_t timer_start = 0;
+static uint32_t timer_start = 0; // Para o temporizador de estágio
+static uint32_t total_time_start = 0; // Para o temporizador total
 static bool timer_active = false;
 static bool timer_finished = false;
 static float temperature = 0.0f;
@@ -62,8 +64,11 @@ static bool display_needs_update = false;
 // Variáveis para debounce
 static uint64_t last_debounce_time_a = 0;
 static uint64_t last_debounce_time_b = 0;
-static bool last_state_a = true; // Pull-up, HIGH (1) é o estado inicial
+static uint64_t last_debounce_time_joystick = 0; // Para o botão do joystick
+static bool last_state_a = true;
 static bool last_state_b = true;
+static bool last_state_joystick = true; // Pull-up, HIGH (1) é o estado inicial
+static float last_temperature = 0.0f; // Temperatura do ciclo anterior
 
 static const uint8_t flame_frames[4][5][5] = {
     {{1, 2, 3, 2, 1}, {0, 1, 2, 1, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}},
@@ -76,7 +81,7 @@ static const uint8_t flame_frames[4][5][5] = {
 bool debounce_button(uint gpio, uint64_t now, bool* last_state, uint64_t* last_debounce_time) {
     bool current_state = gpio_get(gpio);
     if (current_state != *last_state) {
-        *last_debounce_time = now; // Resetar o tempo ao detectar mudança
+        *last_debounce_time = now;
     }
     if ((now - *last_debounce_time) > DEBOUNCE_TIME) {
         if (!current_state) { // Botão pressionado (LOW)
@@ -152,59 +157,131 @@ void show_menu(int selection) {
     draw_double_border();
     ssd1306_draw_string(5, 6, "Selecione:");
     ssd1306_draw_string(5, 16, STAGES[selection].nome);
-    ssd1306_draw_string(5, 48, "A:Prox  B:Sel");
+    ssd1306_draw_string(16, 48, "A:Prox  B:Sel");
     ssd1306_update();
 }
 
-void update_display(float temperature, const brassagem_stage_t* stage, bool flame_active, uint32_t elapsed_time) {
+void update_display(float temperature, const brassagem_stage_t* stage, bool flame_active, uint32_t stage_time, uint32_t total_time) {
     ssd1306_clear();
     draw_double_border();
     char temp_str[16];
     snprintf(temp_str, sizeof(temp_str), "T: %.1f°C", temperature);
-    ssd1306_draw_string(5, 6, temp_str);
-    ssd1306_draw_string(5, 20, stage->nome);
-    char timer_str[16];
-    snprintf(timer_str, sizeof(timer_str), "Time: %lus", elapsed_time);
-    ssd1306_draw_string(5, 38, timer_str);
+    ssd1306_draw_string(5, 6, stage->nome);
+    ssd1306_draw_string(22, 20, temp_str);
+    char stage_timer_str[16];
+    snprintf(stage_timer_str, sizeof(stage_timer_str), "Ti: %lus", stage_time);
+    ssd1306_draw_string(5, 38, stage_timer_str);
+    char total_timer_str[16];
+    snprintf(total_timer_str, sizeof(total_timer_str), "Tt: %lus", total_time);
+    ssd1306_draw_string(64, 38, total_timer_str);
     char flame_str[16];
     snprintf(flame_str, sizeof(flame_str), "Chama: %s", flame_active ? "ON" : "OFF");
     ssd1306_draw_string(5, 48, flame_str);
     ssd1306_update();
 }
 
+// Funções do servo motor
+void servo_init(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    uint32_t clock_freq = clock_get_hz(clk_sys);
+    uint32_t wrap_value = clock_freq / 50 - 1;
+    pwm_set_wrap(slice, wrap_value);
+    pwm_set_clkdiv(slice, 1.0f);
+    pwm_set_enabled(slice, true);
+}
+
+void set_servo_angle(uint gpio, uint8_t angle) {
+    if (angle > 180) angle = 180;
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    uint32_t wrap_value = clock_get_hz(clk_sys) / 50 - 1;
+    uint16_t level = (wrap_value * (1000 + (angle * 1000 / 180))) / 20000;
+    pwm_set_gpio_level(gpio, level);
+}
+
 // Controle de temperatura
-void control_stage(float* temperature, const brassagem_stage_t* stage) {
-    adc_select_input(1);
+void control_stage(float* temperature, const brassagem_stage_t* stage, uint8_t* servo_angle) {
+    adc_select_input(1); // JOYSTICK_Y
     uint16_t raw_y = adc_read();
-    *temperature += ((float)adjust_value(raw_y, y_center) / 4095.0f) * 0.5f;
-    if (*temperature < stage->temp_min) *temperature = stage->temp_min;
+    int16_t y_adjust = adjust_value(raw_y, y_center);
+
+    // Ajusta a temperatura com base no movimento do joystick
+    *temperature += ((float)y_adjust / 4095.0f) * 0.5f;
+
+    if (*temperature < 0.0f) *temperature = 0.0f;
     if (*temperature > stage->temp_max) *temperature = stage->temp_max;
 
-    float tolerance = stage->temp_max * 0.05f;
-    float threshold = stage->temp_max - tolerance;
-
-    if (*temperature >= stage->temp_max) {
-        flame_active = false;
-    } else if (*temperature < threshold) {
+    // Verifica se a temperatura caiu em relação ao ciclo anterior
+    if (*temperature < last_temperature) {
         flame_active = true;
+    } else if (*temperature >= stage->temp_max) {
+        flame_active = false;
     }
-    pwm_set_gpio_level(LED_R, flame_active ? 4095 : 0);
+
+    // Controle proporcional da chama
+    float temp_range = stage->temp_max - stage->temp_min;
+    float temp_progress = (*temperature - stage->temp_min) / temp_range;
+    if (temp_progress < 0) temp_progress = 0;
+    if (temp_progress > 1) temp_progress = 1;
+
+    if (flame_active) {
+        *servo_angle = (uint8_t)(90 * (1 - temp_progress));
+        set_servo_angle(SERVO_PIN, *servo_angle);
+        uint16_t led_intensity = (uint16_t)(4095 * (1 - temp_progress));
+        pwm_set_gpio_level(LED_R, led_intensity);
+        *temperature += 0.1f; // Aumenta a temperatura enquanto a chama está ativa
+    } else {
+        *servo_angle = 0;
+        set_servo_angle(SERVO_PIN, *servo_angle);
+        pwm_set_gpio_level(LED_R, 0);
+    }
+
+    // Atualiza a temperatura anterior para o próximo ciclo
+    last_temperature = *temperature;
 }
 
 // Animação da chama
-void update_flame_animation(PIO pio, uint sm, uint8_t frame) {
+void update_flame_animation(PIO pio, uint sm, uint8_t frame, uint8_t servo_angle) {
+    static const uint8_t flame_frames[4][5][5] = {
+        {{1, 2, 3, 2, 1}, {0, 1, 2, 1, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}},
+        {{1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {0, 1, 2, 1, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 0, 0}},
+        {{1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {0, 1, 2, 1, 0}, {0, 0, 1, 0, 0}},
+        {{1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {1, 2, 3, 2, 1}, {1, 2, 3, 2, 0}, {0, 1, 0, 1, 0}}
+    };
+
+    float brightness = (float)servo_angle / 90.0f;
+    if (brightness < 0.0f) brightness = 0.0f;
+    if (brightness > 1.0f) brightness = 1.0f;
+
     for (int y = 0; y < 5; y++) {
         for (int x = 0; x < 5; x++) {
             uint8_t intensity = flame_frames[frame][y][x];
             uint8_t r = (intensity == 1) ? 64 : (intensity >= 2) ? 255 : 0;
             uint8_t g = (intensity == 2) ? 64 : (intensity == 3) ? 128 : 0;
             uint8_t b = 0;
+
+            r = (uint8_t)(r * brightness);
+            g = (uint8_t)(g * brightness);
+            b = (uint8_t)(b * brightness);
+
             uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
             pio_sm_put_blocking(pio, sm, grb << 8u);
         }
     }
 }
+void show_tela_inicial() {
+    ssd1306_clear();
+    draw_double_border(); // Reutiliza a borda dupla que você já tem
 
+    // "EMBARCATECH" tem 10 caracteres. Cada caractere é 5 pixels de largura + 1 de espaço = 6 pixels por caractere
+    // Total: 10 * 6 = 60 pixels de largura
+    // Centralizar horizontalmente: (128 - 60) / 2 = 34
+    // Centralizar verticalmente: (64 - 8) / 2 = 28 (assumindo altura de fonte de 8 pixels)
+    ssd1306_draw_string(20, 28, "EMBARCATECH");
+
+    ssd1306_update();
+    sleep_ms(3000); // Mostra a tela por 3 segundos
+}
 int main() {
     stdio_init_all();
     sleep_ms(2000);
@@ -226,7 +303,12 @@ int main() {
     uint16_t pulse_max = wrap_value * 0.1;
     stop_buzzer();
 
+    servo_init(SERVO_PIN);
+    set_servo_angle(SERVO_PIN, 0);
+
     ssd1306_init();
+    show_tela_inicial();
+
     PIO pio = pio0;
     uint sm = 0;
     uint offset = pio_add_program(pio, &U7T_projeto_program);
@@ -237,34 +319,59 @@ int main() {
     uint32_t last_blink_time = 0;
     bool led_state = false;
     bool first_max_reached = false;
+    uint8_t servo_angle = 0;
 
     while (true) {
         uint32_t current_time = time_us_32() / 1000000;
-        uint64_t now = time_us_64(); // Tempo em microssegundos para debounce
+        uint64_t now = time_us_64();
 
-        // Verifica os botões com debounce
+        uint32_t stage_time = timer_active ? (current_time - timer_start) : 0;
+        uint32_t total_time = (current_state != MENU_INICIAL && total_time_start != 0) ? (current_time - total_time_start) : 0;
+
         bool btn_a_pressed = debounce_button(BTN_A, now, &last_state_a, &last_debounce_time_a);
         bool btn_b_pressed = debounce_button(BTN_B, now, &last_state_b, &last_debounce_time_b);
+        bool btn_joystick_pressed = debounce_button(JOYSTICK_BTN, now, &last_state_joystick, &last_debounce_time_joystick);
 
-        // Lógica dos botões
+        if (btn_joystick_pressed) {
+            current_state = MENU_INICIAL;
+            menu_selection = 0;
+            flame_active = false;
+            timer_active = false;
+            timer_finished = false;
+            first_max_reached = false;
+            temperature = 0.0f;
+            last_temperature = 0.0f; // Reseta a temperatura anterior
+            timer_start = 0;
+            total_time_start = 0;
+            pwm_set_gpio_level(LED_R, 0);
+            gpio_put(LED_G, false);
+            gpio_put(LED_B, false);
+            set_servo_angle(SERVO_PIN, 0);
+            servo_angle = 0;
+            stop_buzzer();
+        }
+
         if (btn_a_pressed) {
             if (current_state == MENU_INICIAL) {
                 menu_selection = (menu_selection + 1) % NUM_STAGES;
-                display_needs_update = true; // O menu foi alterado
             } else if (timer_finished) {
                 if (current_state == MASH_OUT) {
                     current_state = MENU_INICIAL;
                     menu_selection = 0;
+                    total_time_start = 0;
                 } else {
                     current_state = (system_state_t)(current_state + 1);
                     temperature = STAGES[current_state - PARADA_PROTEICA].temp_min;
+                    last_temperature = temperature; // Inicializa a temperatura anterior
                     timer_active = false;
                     timer_finished = false;
                     flame_active = true;
                     first_max_reached = false;
                 }
-                display_needs_update = true; // O estado foi alterado
                 gpio_put(LED_G, false);
+                gpio_put(LED_B, false);
+                set_servo_angle(SERVO_PIN, 90);
+                servo_angle = 90;
                 stop_buzzer();
             }
         }
@@ -273,11 +380,14 @@ int main() {
             if (current_state == MENU_INICIAL) {
                 current_state = (system_state_t)(PARADA_PROTEICA + menu_selection);
                 temperature = STAGES[menu_selection].temp_min;
+                last_temperature = temperature; // Inicializa a temperatura anterior
                 timer_active = false;
                 timer_finished = false;
                 flame_active = true;
                 first_max_reached = false;
-                display_needs_update = true; // O estado foi alterado
+                set_servo_angle(SERVO_PIN, 90);
+                servo_angle = 90;
+                if (total_time_start == 0) total_time_start = current_time;
             } else {
                 current_state = MENU_INICIAL;
                 flame_active = false;
@@ -285,12 +395,13 @@ int main() {
                 timer_finished = false;
                 pwm_set_gpio_level(LED_R, 0);
                 gpio_put(LED_G, false);
+                gpio_put(LED_B, false);
+                set_servo_angle(SERVO_PIN, 0);
+                servo_angle = 0;
                 stop_buzzer();
-                display_needs_update = true; // O estado foi alterado
             }
         }
 
-        // Lógica do estado
         switch (current_state) {
             case MENU_INICIAL:
                 show_menu(menu_selection);
@@ -299,6 +410,9 @@ int main() {
                 flame_active = false;
                 first_max_reached = false;
                 gpio_put(LED_G, false);
+                gpio_put(LED_B, false);
+                set_servo_angle(SERVO_PIN, 0);
+                servo_angle = 0;
                 stop_buzzer();
                 break;
 
@@ -307,31 +421,32 @@ int main() {
             case ALFA_AMILASE:
             case MASH_OUT: {
                 const brassagem_stage_t* stage = &STAGES[current_state - PARADA_PROTEICA];
-                uint32_t elapsed_time = timer_active ? (current_time - timer_start) : 0;
 
-                control_stage(&temperature, stage);
+                control_stage(&temperature, stage, &servo_angle);
 
                 if (!first_max_reached && temperature >= stage->temp_max) {
                     timer_start = current_time;
                     timer_active = true;
                     first_max_reached = true;
-                    display_needs_update = true; // O temporizador foi iniciado
+                    gpio_put(LED_B, false);
                 }
 
-                if (timer_active && elapsed_time >= stage->duration) {
+                if (timer_active && stage_time >= stage->duration) {
                     timer_finished = true;
-                    display_needs_update = true; // O temporizador terminou
+                    gpio_put(LED_B, false);
                 }
 
-                if (display_needs_update) {
-                    update_display(temperature, stage, flame_active, elapsed_time);
-                    display_needs_update = false; // Redefine a flag após a atualização
-                }
+                update_display(temperature, stage, flame_active, stage_time, total_time);
 
                 if (timer_finished) {
                     if ((current_time - last_blink_time) >= 1) {
                         led_state = !led_state;
                         gpio_put(LED_G, led_state);
+                        if (led_state) {
+                            set_buzzer_position(pulse_max);
+                            sleep_ms(250);
+                            stop_buzzer();
+                        }
                         last_blink_time = current_time;
                     }
                 }
@@ -340,7 +455,7 @@ int main() {
         }
 
         if (flame_active) {
-            update_flame_animation(pio, sm, flame_frame);
+            update_flame_animation(pio, sm, flame_frame, servo_angle);
             flame_frame = (flame_frame + 1) % 4;
         } else {
             for (int i = 0; i < 25; i++) pio_sm_put_blocking(pio, sm, 0 << 8u);
